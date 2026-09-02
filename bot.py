@@ -48,7 +48,7 @@ def normalize_phone(raw):
         return raw
     return None
 
-# ---------- Ожидание QR (бесконечное) ----------
+# ---------- Ожидание QR ----------
 async def wait_for_qr_scan(page):
     print("🔍 Проверка авторизации WhatsApp...")
     canvas = await page.query_selector('canvas[aria-label="Scan me!"]')
@@ -105,7 +105,6 @@ async def search_google(query):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         page = await browser.new_page()
-        # Случайный User-Agent
         ua = random.choice([
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -120,7 +119,6 @@ async def search_google(query):
             print("⚠️ Google не ответил (возможно капча). Пропускаем.")
             await browser.close()
             return []
-        # Проверка на капчу
         if await page.query_selector('form#captcha-form'):
             print("⚠️ Обнаружена капча Google. Пропускаем.")
             await browser.close()
@@ -169,31 +167,53 @@ async def check_whatsapp_on_page(url):
     except Exception:
         return None
 
-# ---------- 2GIS (для поиска без сайта) ----------
-async def search_2gis(query, city):
+# ---------- НОВЫЙ ПАРСИНГ через Яндекс Карты ----------
+async def search_yandex_maps(query, city):
+    """Ищет организации на Яндекс.Картах, возвращает список с телефоном и признаком сайта"""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         page = await browser.new_page()
-        url = f"https://2gis.ru/{city}/search/{query.replace(' ', '%20')}"
+        # Формируем URL для поиска на Яндекс.Картах
+        url = f"https://yandex.ru/maps/?text={query.replace(' ', '+')}+{city.replace(' ', '+')}&sll=37.617698,55.755864&ll=37.617698,55.755864&z=12"
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception:
-            print("⚠️ 2GIS не загрузился.")
+            print("⚠️ Яндекс Карты не загрузились.")
             return []
-        await page.wait_for_timeout(3000)  # даём время для подгрузки
-        cards = await page.query_selector_all('div._1x6f0')
+        # Ждём появления списка организаций
+        await page.wait_for_timeout(5000)  # ждём подгрузку результатов
+        # Селекторы могут меняться, но чаще всего карточки находятся в ul[data-testid="search-results"] > li
+        cards = await page.query_selector_all('ul[data-testid="search-results"] > li')
+        if not cards:
+            # пробуем альтернативный селектор
+            cards = await page.query_selector_all('div[data-testid="search-results"] div[data-testid="search-snippet"]')
         results = []
         for card in cards[:20]:
-            name_elem = await card.query_selector('div._1f2p7 a')
-            phone_elem = await card.query_selector('div._1yf0b a[href^="tel:"]')
-            site_elem = await card.query_selector('a[href^="http"][target="_blank"]')
-            if name_elem and phone_elem:
-                name = await name_elem.inner_text()
+            # Извлекаем название
+            name_elem = await card.query_selector('span[class*="title"]')
+            if not name_elem:
+                continue
+            name = await name_elem.inner_text()
+            # Извлекаем телефон (может быть в ссылке tel:)
+            phone_elem = await card.query_selector('a[href^="tel:"]')
+            phone = None
+            if phone_elem:
                 phone_raw = await phone_elem.get_attribute('href')
                 phone = normalize_phone(phone_raw.replace('tel:', ''))
-                has_site = site_elem is not None
-                if phone:
-                    results.append({'name': name, 'phone': phone, 'has_site': has_site})
+            # Проверяем наличие сайта (обычно ссылка с классом, содержащим "website")
+            site_elem = await card.query_selector('a[href^="http"][target="_blank"]')
+            has_site = site_elem is not None
+            # Если сайт не найден, но есть ссылка на соцсети – не считаем сайтом
+            if has_site:
+                link = await site_elem.get_attribute('href')
+                if link and any(s in link for s in ['vk.com', 'facebook.com', 'instagram.com', 'youtube.com']):
+                    has_site = False
+            if phone:
+                results.append({
+                    'name': name,
+                    'phone': phone,
+                    'has_site': has_site
+                })
         await browser.close()
         return results
 
@@ -204,7 +224,7 @@ async def main():
         processed = load_processed()
         all_contacts = []
 
-        # 1. Google (с обработкой ошибок)
+        # 1. Google (если не работает – пропускаем)
         print("🔎 Поиск через Google...")
         google_results = await search_google(f"{SEARCH_QUERY} {CITY}")
         for item in google_results:
@@ -213,10 +233,10 @@ async def main():
                 all_contacts.append({'name': item['name'], 'phone': phone, 'has_site': True})
             await asyncio.sleep(1)
 
-        # 2. 2GIS
-        print("🔎 Поиск через 2GIS...")
-        gis_results = await search_2gis(SEARCH_QUERY, CITY)
-        for item in gis_results:
+        # 2. Яндекс Карты (вместо 2GIS)
+        print("🔎 Поиск через Яндекс Карты...")
+        yandex_results = await search_yandex_maps(SEARCH_QUERY, CITY)
+        for item in yandex_results:
             if item['phone'] not in processed:
                 all_contacts.append(item)
 
@@ -229,20 +249,25 @@ async def main():
 
         print(f"📋 Найдено уникальных контактов: {len(contacts)}")
 
-        for contact in contacts:
-            phone = contact['phone']
-            if phone in processed:
-                continue
-            msg = MESSAGE_WITH_SITE if contact['has_site'] else MESSAGE_NO_SITE
-            try:
-                await send_whatsapp(phone, msg)
-                save_processed(phone)
-                print(f"✅ Отправлено {phone} (сайт: {contact['has_site']})")
-                delay = random.randint(60, 180)
-                print(f"⏳ Ждём {delay} сек.")
-                await asyncio.sleep(delay)
-            except Exception as e:
-                print(f"⚠️ Ошибка для {phone}: {e}")
+        if contacts:
+            for contact in contacts:
+                phone = contact['phone']
+                if phone in processed:
+                    continue
+                msg = MESSAGE_WITH_SITE if contact['has_site'] else MESSAGE_NO_SITE
+                try:
+                    await send_whatsapp(phone, msg)
+                    save_processed(phone)
+                    print(f"✅ Отправлено {phone} (сайт: {contact['has_site']})")
+                    delay = random.randint(60, 180)
+                    print(f"⏳ Ждём {delay} сек.")
+                    await asyncio.sleep(delay)
+                except Exception as e:
+                    print(f"⚠️ Ошибка для {phone}: {e}")
+        else:
+            print("⚠️ Контактов не найдено. Повтор через 15 минут.")
+            await asyncio.sleep(900)  # 15 минут
+            continue
 
         print(f"💤 Цикл завершён. Следующий запуск через {SLEEP_HOURS} часов.")
         await asyncio.sleep(SLEEP_HOURS * 3600)
