@@ -9,7 +9,6 @@ load_dotenv()
 
 SESSION_PATH = os.getenv("SESSION_PATH", "./wa_session")
 CSV_FILE = "clients.csv"
-PROCESSED_FILE = "processed_phones.txt"
 
 MESSAGE_WITH_SITE = os.getenv("MESSAGE_WITH_SITE", 
     "Здравствуйте! ... (текст для сайта)"
@@ -20,18 +19,8 @@ MESSAGE_NO_SITE = os.getenv("MESSAGE_NO_SITE",
 
 os.makedirs(SESSION_PATH, exist_ok=True)
 
-def load_processed():
-    if not os.path.exists(PROCESSED_FILE):
-        return set()
-    with open(PROCESSED_FILE, 'r') as f:
-        return set(line.strip() for line in f)
-
-def save_processed(phone):
-    with open(PROCESSED_FILE, 'a') as f:
-        f.write(phone + "\n")
-
 def normalize_phone(raw):
-    raw = ''.join(filter(str.isdigit, raw))  # оставляем только цифры
+    raw = ''.join(filter(str.isdigit, raw))
     if raw.startswith('8') and len(raw) == 11:
         return '+7' + raw[1:]
     elif raw.startswith('7') and len(raw) == 11:
@@ -91,35 +80,68 @@ async def send_whatsapp(phone, message):
         await browser.close()
 
 async def main():
-    processed = load_processed()
+    # Проверяем, есть ли файл CSV
     if not os.path.exists(CSV_FILE):
         print(f"❌ Файл {CSV_FILE} не найден. Создайте его с колонками: phone,name,site")
         return
+
+    # Читаем все строки
     with open(CSV_FILE, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         contacts = list(reader)
+
+    if not contacts:
+        print("✅ В CSV нет контактов. Работа завершена.")
+        return
+
     print(f"📋 Загружено {len(contacts)} контактов.")
-    for contact in contacts:
+
+    # Список для отправленных (чтобы потом удалить их из файла)
+    sent_phones = []
+
+    for idx, contact in enumerate(contacts):
         phone_raw = contact.get('phone', '').strip()
         phone = normalize_phone(phone_raw)
         if not phone:
             print(f"⚠️ Неверный номер: {phone_raw} — пропускаем")
             continue
-        if phone in processed:
-            print(f"⏭️ {phone} уже обработан, пропускаем.")
-            continue
+
         name = contact.get('name', '').strip()
         site_value = contact.get('site', '').strip()
-        has_site = bool(site_value)  # если есть любой текст в колонке site → сайт есть
+        has_site = bool(site_value)
         msg = MESSAGE_WITH_SITE if has_site else MESSAGE_NO_SITE
         msg = msg.replace("{name}", name) if name else msg
+
         try:
             await send_whatsapp(phone, msg)
-            save_processed(phone)
+            sent_phones.append(idx)  # запоминаем индекс отправленного
             print(f"✅ Отправлено {phone} (сайт: {has_site})")
             await asyncio.sleep(60)  # пауза 1 минута
         except Exception as e:
             print(f"⚠️ Ошибка для {phone}: {e}")
+            # Если ошибка критическая (например, сессия), можно прервать
+            if "не авторизован" in str(e).lower():
+                print("❌ Остановка из-за проблемы с авторизацией.")
+                break
+
+    # Удаляем отправленные строки из CSV (перезаписываем файл)
+    if sent_phones:
+        with open(CSV_FILE, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            all_rows = list(reader)
+        # Оставляем только те, которые не отправлены
+        remaining = [row for i, row in enumerate(all_rows) if i not in sent_phones]
+        if remaining:
+            with open(CSV_FILE, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['phone', 'name', 'site'])
+                writer.writeheader()
+                writer.writerows(remaining)
+            print(f"🗑️ Удалено {len(sent_phones)} отправленных контактов из CSV. Осталось {len(remaining)}.")
+        else:
+            # Если все отправлены — удаляем файл или очищаем
+            open(CSV_FILE, 'w', encoding='utf-8').close()
+            print("🗑️ Все контакты отправлены. CSV очищен.")
+
     print("✅ Все сообщения отправлены.")
 
 if __name__ == "__main__":
