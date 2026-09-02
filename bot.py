@@ -9,11 +9,11 @@ from playwright.async_api import async_playwright
 
 load_dotenv()
 
-# ---------- Конфигурация из переменных окружения ----------
+# ---------- Конфигурация ----------
 CITY = os.getenv("CITY", "Москва")
 SEARCH_QUERY = os.getenv("SEARCH_QUERY", "фитнес зал")
 SESSION_PATH = os.getenv("SESSION_PATH", "./wa_session")
-SLEEP_HOURS = int(os.getenv("SLEEP_HOURS", "6"))  # пауза между циклами
+SLEEP_HOURS = int(os.getenv("SLEEP_HOURS", "6"))
 
 MESSAGE_WITH_SITE = os.getenv("MESSAGE_WITH_SITE", 
     "Здравствуйте! ... (текст для сайта)"
@@ -48,15 +48,12 @@ def normalize_phone(raw):
         return raw
     return None
 
-# ---------- Ожидание сканирования QR (бесконечное) ----------
+# ---------- Ожидание QR (бесконечное) ----------
 async def wait_for_qr_scan(page):
-    """Выводит QR-код в логи и ждёт сканирования бесконечно."""
     print("🔍 Проверка авторизации WhatsApp...")
     canvas = await page.query_selector('canvas[aria-label="Scan me!"]')
     if not canvas:
-        return True  # уже авторизованы
-
-    # Получаем данные для QR из data-ref
+        return True
     parent = await canvas.evaluate_handle('el => el.parentElement')
     data_ref = await parent.get_attribute('data-ref')
     if not data_ref:
@@ -66,22 +63,19 @@ async def wait_for_qr_scan(page):
     if not data_ref:
         print("❌ Не удалось извлечь данные для QR-кода.")
         return False
-
-    # Генерация ASCII-кода
     qr = qrcode.QRCode(box_size=2, border=1)
     qr.add_data(data_ref)
     qr.make(fit=True)
     print("\n📲 ОТСКАНИРУЙТЕ QR-КОД В WHATSAPP:\n")
     qr.print_ascii(invert=True)
     print("\n⏳ Ожидание сканирования... (бесконечно)\n")
-
     while True:
         await asyncio.sleep(5)
         if await page.query_selector('canvas[aria-label="Scan me!"]') is None:
             print("✅ QR-код успешно отсканирован!")
             return True
 
-# ---------- Отправка через WhatsApp (с проверкой сессии) ----------
+# ---------- Отправка WhatsApp ----------
 async def send_whatsapp(phone, message):
     async with async_playwright() as p:
         browser = await p.chromium.launch_persistent_context(
@@ -91,14 +85,9 @@ async def send_whatsapp(phone, message):
         )
         page = await browser.new_page()
         await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
-
-        # Если видим QR – ждём сканирования
         if await page.query_selector('canvas[aria-label="Scan me!"]'):
             print("⚠️ Сессия отсутствует или недействительна.")
             await wait_for_qr_scan(page)
-            # После сканирования сессия сохраняется автоматически
-
-        # Отправка сообщения
         chat_input = page.locator('div[contenteditable="true"][data-tab="10"]')
         await chat_input.click()
         await chat_input.fill(phone)
@@ -111,15 +100,31 @@ async def send_whatsapp(phone, message):
         await page.wait_for_timeout(3000)
         await browser.close()
 
-# ---------- Поиск через Google ----------
+# ---------- Поиск через Google (с обработкой ошибок) ----------
 async def search_google(query):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         page = await browser.new_page()
-        await page.set_extra_http_headers({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'})
+        # Случайный User-Agent
+        ua = random.choice([
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+        ])
+        await page.set_extra_http_headers({'User-Agent': ua})
         url = f"https://www.google.com/search?q={query.replace(' ', '+')}&num=30"
-        await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_selector('div#search', timeout=10000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.wait_for_selector('div#search', timeout=30000)
+        except Exception:
+            print("⚠️ Google не ответил (возможно капча). Пропускаем.")
+            await browser.close()
+            return []
+        # Проверка на капчу
+        if await page.query_selector('form#captcha-form'):
+            print("⚠️ Обнаружена капча Google. Пропускаем.")
+            await browser.close()
+            return []
         results = []
         items = await page.query_selector_all('div.g')
         for item in items:
@@ -139,7 +144,7 @@ async def check_whatsapp_on_page(url):
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
             page = await browser.new_page()
-            await page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            await page.goto(url, timeout=20000, wait_until="domcontentloaded")
             content = await page.content()
             phone_patterns = [
                 r'\+7\s*\(?\d{3}\)?\s*\d{3}[\s-]?\d{2}[\s-]?\d{2}',
@@ -170,8 +175,12 @@ async def search_2gis(query, city):
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         page = await browser.new_page()
         url = f"https://2gis.ru/{city}/search/{query.replace(' ', '%20')}"
-        await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_selector('div._1x6f0', timeout=15000)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            print("⚠️ 2GIS не загрузился.")
+            return []
+        await page.wait_for_timeout(3000)  # даём время для подгрузки
         cards = await page.query_selector_all('div._1x6f0')
         results = []
         for card in cards[:20]:
@@ -195,7 +204,7 @@ async def main():
         processed = load_processed()
         all_contacts = []
 
-        # 1. Поиск через Google (есть сайт)
+        # 1. Google (с обработкой ошибок)
         print("🔎 Поиск через Google...")
         google_results = await search_google(f"{SEARCH_QUERY} {CITY}")
         for item in google_results:
@@ -204,7 +213,7 @@ async def main():
                 all_contacts.append({'name': item['name'], 'phone': phone, 'has_site': True})
             await asyncio.sleep(1)
 
-        # 2. Поиск через 2GIS (может быть сайт или нет)
+        # 2. 2GIS
         print("🔎 Поиск через 2GIS...")
         gis_results = await search_2gis(SEARCH_QUERY, CITY)
         for item in gis_results:
@@ -220,7 +229,6 @@ async def main():
 
         print(f"📋 Найдено уникальных контактов: {len(contacts)}")
 
-        # Отправка сообщений
         for contact in contacts:
             phone = contact['phone']
             if phone in processed:
@@ -236,7 +244,6 @@ async def main():
             except Exception as e:
                 print(f"⚠️ Ошибка для {phone}: {e}")
 
-        # Пауза до следующего цикла
         print(f"💤 Цикл завершён. Следующий запуск через {SLEEP_HOURS} часов.")
         await asyncio.sleep(SLEEP_HOURS * 3600)
 
